@@ -1,0 +1,354 @@
+LTX-2 trainer changes used by SimPWM. Base: https://github.com/Lightricks/LTX-2 at e98f6d927d83c92ef2be6aec76c8440b19306e39.
+Apply with `git -C deps/LTX-2 apply ../../patches/ltx_trainer.patch` (see docs/installation.md).
+
+  process_dataset.py   --fps (frame rate recorded instead of the container's; DROID raw MP4s are muxed at 60 fps) and
+                       --reshape-mode stretch (resize to the bucket without cropping)
+  trainer.py           LR schedule length x num_processes; validation samples with the DDP-unwrapped model;
+                       SIMPWM_BUCKET_MAP=<dataset.jsonl>: bucket-synchronised batches for length-bucketed data;
+                       SIMPWM_DIST_TIMEOUT_S=<seconds>: process-group timeout
+  flexible.py          SIMPWM_REF_POS_FIX=1: reference scale factors inferred under the preprocessed data root, so the
+                       reference positions are rescaled in training as at inference
+
+diff --git a/packages/ltx-trainer/scripts/process_dataset.py b/packages/ltx-trainer/scripts/process_dataset.py
+index 92b450a..918aa9b 100755
+--- a/packages/ltx-trainer/scripts/process_dataset.py
++++ b/packages/ltx-trainer/scripts/process_dataset.py
+@@ -73,6 +73,8 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
+     skip_audio: bool = False,
+     audio_durations: list[float] | None = None,
+     load_text_encoder_in_8bit: bool = False,
++    reshape_mode: str = "center",
++    fps: float | None = None,
+     overwrite: bool = False,
+ ) -> None:
+     """Run the preprocessing pipeline with convention-based column detection."""
+@@ -159,6 +161,8 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
+                 with_audio=auto_audio,
+                 audio_output_dir=audio_latents_dir,
+                 overwrite=overwrite,
++                reshape_mode=reshape_mode,
++                fps=fps,
+             )
+ 
+         # Process reference video if present
+@@ -197,6 +201,8 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
+                     device=device,
+                     vae_tiling=vae_tiling,
+                     overwrite=overwrite,
++                    reshape_mode=reshape_mode,
++                    fps=fps,
+                     temporal_subsample_factor=reference_temporal_scale_factor,
+                 )
+ 
+@@ -397,6 +403,14 @@ def main(  # noqa: PLR0913
+         default=1,
+         help="Downscale factor for reference video resolution (e.g., 2 = half resolution for IC-LoRA)",
+     ),
++    fps: float | None = typer.Option(
++        default=None,
++        help="Frame rate to record for every video instead of its container's (e.g. 15 for DROID ext1 MP4s muxed at 60)",
++    ),
++    reshape_mode: str = typer.Option(
++        default="center",
++        help="How to fit videos to the bucket: 'center' / 'random' crop, or 'stretch' (resize, no crop)",
++    ),
+     reference_temporal_scale_factor: int = typer.Option(
+         default=1,
+         help="Temporal subsampling factor for reference videos (e.g., 2 = half frame rate, "
+@@ -460,6 +474,8 @@ def main(  # noqa: PLR0913
+         reference_temporal_scale_factor=reference_temporal_scale_factor,
+         skip_audio=skip_audio,
+         audio_durations=parsed_audio_durations,
++        reshape_mode=reshape_mode,
++        fps=fps,
+         load_text_encoder_in_8bit=load_text_encoder_in_8bit,
+         overwrite=overwrite,
+     )
+diff --git a/packages/ltx-trainer/src/ltx_trainer/process_videos.py b/packages/ltx-trainer/src/ltx_trainer/process_videos.py
+index 1a7c94a..5602261 100755
+--- a/packages/ltx-trainer/src/ltx_trainer/process_videos.py
++++ b/packages/ltx-trainer/src/ltx_trainer/process_videos.py
+@@ -100,6 +100,7 @@ class MediaDataset(Dataset):
+         reshape_mode: str = "center",
+         with_audio: bool = False,
+         temporal_subsample_factor: int = 1,
++        fps: float | None = None,
+     ) -> None:
+         """
+         Initialize the media dataset.
+@@ -107,12 +108,15 @@ class MediaDataset(Dataset):
+             dataset_file: Path to CSV/JSON/JSONL metadata file
+             video_column: Column name for video paths in the metadata file
+             resolution_buckets: List of (frames, height, width) tuples
+-            reshape_mode: How to crop videos ("center", "random")
++            reshape_mode: How to crop videos ("center", "random", "stretch")
+             with_audio: Whether to extract audio from video files
+             temporal_subsample_factor: Factor for VAE-aligned temporal subsampling.
+                 When > 1, keeps frame 0 then takes every Nth frame from frame 1 onwards.
++            fps: Frame rate to record instead of the container's (whose time base can be wrong, e.g. a 15 Hz
++                recording muxed at 60 fps); None keeps the container's.
+         """
+         super().__init__()
++        self.fps = fps
+ 
+         self.dataset_file = Path(dataset_file)
+         self.main_media_column = main_media_column
+@@ -162,6 +166,7 @@ class MediaDataset(Dataset):
+             audio_data = None  # Images don't have audio
+         else:
+             media_tensor, fps = self._preprocess_video(video_path)
++            fps = self.fps or fps
+ 
+             # Extract audio if enabled
+             if self.with_audio:
+@@ -332,7 +337,9 @@ class MediaDataset(Dataset):
+         return nearest_bucket
+ 
+     def _resize_and_crop(self, media_tensor: torch.Tensor, target_height: int, target_width: int) -> torch.Tensor:
+-        """Resize and crop tensor to target size."""
++        """Resize and crop tensor to target size ("stretch": resize to it, no crop, aspect ratio not kept)."""
++        if self.reshape_mode == "stretch":
++            return resize(media_tensor, size=[target_height, target_width], interpolation=InterpolationMode.BICUBIC).squeeze(0)
+         # Get current dimensions
+         current_height, current_width = media_tensor.shape[2], media_tensor.shape[3]
+ 
+@@ -411,6 +418,7 @@ def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
+     num_dataloader_workers: int = 4,
+     overwrite: bool = False,
+     temporal_subsample_factor: int = 1,
++    fps: float | None = None,
+ ) -> None:
+     """
+     Process videos and save latent representations.
+@@ -424,7 +432,7 @@ def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
+         resolution_buckets: List of (frames, height, width) tuples
+         output_dir: Directory to save video latents
+         model_path: Path to LTX-2 checkpoint (.safetensors)
+-        reshape_mode: How to crop videos ("center", "random")
++        reshape_mode: How to crop videos ("center", "random", "stretch")
+         main_media_column: Column name for main media paths (if different from video_column)
+         batch_size: Batch size for processing
+         device: Device to use for computation
+@@ -471,6 +479,7 @@ def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
+         reshape_mode=reshape_mode,
+         with_audio=with_audio,
+         temporal_subsample_factor=temporal_subsample_factor,
++        fps=fps,
+     )
+     logger.info(f"Loaded {len(dataset)} valid media files")
+ 
+diff --git a/packages/ltx-trainer/src/ltx_trainer/trainer.py b/packages/ltx-trainer/src/ltx_trainer/trainer.py
+index 372d060..01dfd34 100644
+--- a/packages/ltx-trainer/src/ltx_trainer/trainer.py
++++ b/packages/ltx-trainer/src/ltx_trainer/trainer.py
+@@ -1,11 +1,15 @@
+ import contextlib
++import json
+ import math
+ import os
++import random
+ import re
+ import time
+ import warnings
++from collections import defaultdict
+ from collections.abc import Iterator
+ from dataclasses import dataclass
++from datetime import timedelta
+ from pathlib import Path
+ from typing import Any, Callable
+ 
+@@ -13,7 +17,7 @@ import torch
+ import wandb
+ import yaml
+ from accelerate import Accelerator, DistributedType
+-from accelerate.utils import DistributedDataParallelKwargs, gather_object, set_seed
++from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs, gather_object, set_seed
+ from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
+ from peft.tuners.tuners_utils import BaseTunerLayer
+ from peft.utils import ModulesToSaveWrapper
+@@ -98,6 +102,12 @@ class LtxvTrainer:
+         if IS_MAIN_PROCESS:
+             print_config(trainer_config)
+         self._training_strategy = get_training_strategy(self._config.training_strategy)
++        if hasattr(self._training_strategy, "set_data_root"):
++            self._training_strategy.set_data_root(self._config.data.preprocessed_data_root)
++            logger.info(
++                f"Reference scale factors: spatial={getattr(self._training_strategy, 'reference_spatial_scale_factor', None)} "
++                f"temporal={getattr(self._training_strategy, 'reference_temporal_scale_factor', None)}"
++            )
+         # The VAE isn't loaded during training (latents are precomputed), so source the
+         # video compression factors from the checkpoint's embedded VAE config. This keeps
+         # the RoPE positions consistent with the VAE that produced the latents (and with
+@@ -682,15 +692,30 @@ class LtxvTrainer:
+             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
+ 
+         num_workers = self._config.data.num_dataloader_workers
+-        dataloader = DataLoader(
+-            self._dataset,
+-            batch_size=self._config.optimization.batch_size,
+-            shuffle=True,
+-            drop_last=True,
+-            num_workers=num_workers,
+-            pin_memory=num_workers > 0,
+-            persistent_workers=num_workers > 0,
+-        )
++        if os.environ.get("SIMPWM_BUCKET_MAP"):  # length-bucketed data: every rank gets the same bucket at each step
++            dataloader = DataLoader(
++                self._dataset,
++                batch_sampler=_SyncBucketBatchSampler(
++                    self._dataset,
++                    os.environ["SIMPWM_BUCKET_MAP"],
++                    self._accelerator.num_processes,
++                    self._config.optimization.batch_size,
++                    self._config.seed,
++                ),
++                num_workers=num_workers,
++                pin_memory=num_workers > 0,
++                persistent_workers=num_workers > 0,
++            )
++        else:
++            dataloader = DataLoader(
++                self._dataset,
++                batch_size=self._config.optimization.batch_size,
++                shuffle=True,
++                drop_last=True,
++                num_workers=num_workers,
++                pin_memory=num_workers > 0,
++                persistent_workers=num_workers > 0,
++            )
+ 
+         self._dataloader = self._accelerator.prepare(dataloader)
+ 
+@@ -724,7 +749,9 @@ class LtxvTrainer:
+     def _create_scheduler(self, optimizer: torch.optim.Optimizer) -> LRScheduler | None:
+         """Create learning rate scheduler based on config."""
+         scheduler_type = self._config.optimization.scheduler_type
+-        steps = self._config.optimization.steps
++        # accelerate's prepared scheduler steps num_processes times per optimizer step (split_batches=False), so the
++        # schedule length is counted in those sub-steps; without this an 8-GPU run finishes its schedule at 1/8 of training
++        steps = self._config.optimization.steps * self._accelerator.num_processes
+         params = self._config.optimization.scheduler_params or {}
+ 
+         if scheduler_type is None:
+@@ -783,12 +810,16 @@ class LtxvTrainer:
+         # single-GPU runs. The probing cost is paid only on the first step.
+         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+ 
++        handlers = [ddp_kwargs]
++        if os.environ.get("SIMPWM_DIST_TIMEOUT_S"):  # process-group timeout in seconds (default 10 min): long validations
++            handlers.append(InitProcessGroupKwargs(timeout=timedelta(seconds=int(os.environ["SIMPWM_DIST_TIMEOUT_S"]))))
++
+         # All distributed setup (DDP/FSDP, number of processes, etc.) is controlled by
+         # the user's Accelerate configuration (accelerate config / accelerate launch).
+         self._accelerator = Accelerator(
+             mixed_precision=self._config.acceleration.mixed_precision_mode,
+             gradient_accumulation_steps=self._config.optimization.gradient_accumulation_steps,
+-            kwargs_handlers=[ddp_kwargs],
++            kwargs_handlers=handlers,
+         )
+ 
+         if self._accelerator.num_processes > 1:
+@@ -891,8 +922,13 @@ class LtxvTrainer:
+ 
+         # W&B logging is handled by the trainer (after gathering across ranks),
+         # so we always pass wandb_run=None to the runner.
++        # DDP: sample with the unwrapped model (the runner reads model attributes such as num_blocks, and an
++        # inference-only forward needs no DDP sync); FSDP keeps the wrapper for its sharded forwards
++        sampler = self._transformer
++        if self._accelerator.distributed_type != DistributedType.FSDP:
++            sampler = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
+         sampled = self._validation_runner.run(
+-            transformer=self._transformer,
++            transformer=sampler,
+             step=self._global_step,
+             output_dir=Path(self._config.output_dir),
+             device=self._accelerator.device,
+@@ -1127,3 +1163,42 @@ class LtxvTrainer:
+         """Log metrics to Weights & Biases."""
+         if self._wandb_run is not None:
+             self._wandb_run.log(metrics)
++
++
++class _SyncBucketBatchSampler:
++    """Batches for length-bucketed data (SIMPWM_BUCKET_MAP: a dataset.jsonl whose rows give the "bucket" of each "video";
++    the latent file videos/<stem>.pt belongs to the row with video videos/<stem>.mp4).
++
++    Each epoch: per bucket, a seeded shuffle cut into groups of world_size batches; the groups are shuffled and
++    concatenated. accelerate shards a batch sampler round-robin (batch k -> rank k mod world_size), so all ranks draw
++    the same bucket at every step and no rank waits on a longer clip. Identical on every rank (same seed and epoch).
++    """
++
++    def __init__(self, dataset, bucket_map: str, world: int, batch_size: int, seed: int) -> None:
++        rows = [json.loads(line) for line in open(bucket_map)]
++        by_stem = {Path(r["video"]).stem: r["bucket"] for r in rows if r.get("video")}
++        files = dataset.sample_files[next(iter(dataset.sample_files))]
++        self.groups = defaultdict(list)
++        for i, f in enumerate(files):
++            self.groups[by_stem.get(Path(f).stem)].append(i)
++        self.world, self.bs, self.seed, self.epoch = world, batch_size, seed, 0
++        logger.info(f"bucket-synchronised sampler: {({k: len(v) for k, v in self.groups.items()})}, world {world}")
++
++    def _batches(self, epoch: int) -> list[list[int]]:
++        rng = random.Random(self.seed + epoch)
++        units = []
++        for _, idx in sorted(self.groups.items(), key=lambda kv: str(kv[0])):
++            idx = idx[:]
++            rng.shuffle(idx)
++            batches = [idx[k : k + self.bs] for k in range(0, len(idx) - self.bs + 1, self.bs)]
++            units += [batches[k : k + self.world] for k in range(0, len(batches) - self.world + 1, self.world)]
++        rng.shuffle(units)
++        return [b for u in units for b in u]
++
++    def __iter__(self) -> Iterator[list[int]]:
++        batches = self._batches(self.epoch)
++        self.epoch += 1
++        return iter(batches)
++
++    def __len__(self) -> int:
++        return len(self._batches(self.epoch))
+diff --git a/packages/ltx-trainer/src/ltx_trainer/training_strategies/flexible.py b/packages/ltx-trainer/src/ltx_trainer/training_strategies/flexible.py
+index a46cb01..0ee6621 100644
+--- a/packages/ltx-trainer/src/ltx_trainer/training_strategies/flexible.py
++++ b/packages/ltx-trainer/src/ltx_trainer/training_strategies/flexible.py
+@@ -7,6 +7,7 @@ The flexible strategy replaces TextToVideoStrategy and VideoToVideoStrategy by e
+ all conditioning scenarios through configuration rather than code.
+ """
+ 
++import os
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Annotated, Any, Literal, Union
+@@ -317,15 +318,30 @@ class FlexibleStrategy(TrainingStrategy):
+             metadata["reference_temporal_scale_factor"] = temporal
+         return metadata
+ 
+-    def _infer_reference_scale_factors_from_config(self) -> tuple[int | None, int | None]:
++    def set_data_root(self, data_root: str | Path) -> None:
++        """Re-infer the reference scale factors with the latents directories resolved under the preprocessed data root
++        (applied when SIMPWM_REF_POS_FIX=1).
++
++        The constructor sees only the strategy config, whose latents_dir values are relative to that root, so from the
++        trainer's working directory it finds no sample pair and leaves the factors at None: reference positions are
++        then not rescaled in training, while inference rescales them by the condition's downscale_factor.
++        """
++        if os.environ.get("SIMPWM_REF_POS_FIX") != "1":
++            return
++        self.reference_spatial_scale_factor, self.reference_temporal_scale_factor = (
++            self._infer_reference_scale_factors_from_config(Path(data_root))
++        )
++
++    def _infer_reference_scale_factors_from_config(self, data_root: Path | None = None) -> tuple[int | None, int | None]:
+         """Infer spatial and temporal scale factors by peeking at one sample pair."""
+         if self.config.video is None:
+             return None, None
++        base = data_root if data_root is not None else Path()
+         for cond in self.config.video.conditions:
+             if not isinstance(cond, ReferenceConditionConfig):
+                 continue
+-            target_dir = Path(self.config.video.latents_dir)
+-            ref_dir = Path(cond.latents_dir)
++            target_dir = base / self.config.video.latents_dir
++            ref_dir = base / cond.latents_dir
+             for sample_file in target_dir.rglob("*.pt"):
+                 ref_file = ref_dir / sample_file.relative_to(target_dir)
+                 if not ref_file.exists():

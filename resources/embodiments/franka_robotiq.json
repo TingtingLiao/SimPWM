@@ -1,0 +1,51 @@
+{
+  "name": "franka_robotiq",
+  "description": "Franka FR3 arm + Robotiq 2F-85 parallel gripper (DROID).",
+  "arm_mjcf": "mujoco_menagerie/franka_fr3/fr3.xml",
+  "arm_joints": [
+    "fr3_joint1",
+    "fr3_joint2",
+    "fr3_joint3",
+    "fr3_joint4",
+    "fr3_joint5",
+    "fr3_joint6",
+    "fr3_joint7"
+  ],
+  "gripper_mjcf": "mujoco_menagerie/robotiq_2f85/2f85.xml",
+  "attach_site": "attachment_site",
+  "gripper_yaw_deg": 90.0,
+  "gripper_ctrl_range": [
+    0,
+    255
+  ],
+  "gripper_root_body": "g_base_mount",
+  "pad_bodies": [
+    "g_left_pad",
+    "g_right_pad"
+  ],
+  "render_groups": [
+    2
+  ],
+  "keypoints": {
+    "tcp": {
+      "site": "g_pinch"
+    },
+    "pad_l": {
+      "body": "g_left_pad",
+      "offset": [
+        0,
+        -0.0026,
+        0.019
+      ]
+    },
+    "pad_r": {
+      "body": "g_right_pad",
+      "offset": [
+        0,
+        -0.0026,
+        0.019
+      ]
+    }
+  },
+  "max_open_m": 0.085
+}

@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ruff_cache/
+
+# downloaded or generated, never committed
+/assets/
+/data/
+/deps/
+/models/
+/runs/
+/logs/
+slurm-*.out
+MUJOCO_LOG.TXT

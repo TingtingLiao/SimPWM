@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simpwm"
+version = "0.1.0"
+description = "SimPWM: Simulator-as-Proxy World Model for Robot Manipulation"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "opencv-python",
+    "pillow",
+    "imageio[ffmpeg]",
+    "av",
+    "h5py",
+    "pyyaml",
+    "torch>=2.4",
+    "mujoco>=3.1",
+    "transformers>=5",
+    "huggingface_hub>=1.0",
+]
+
+[project.optional-dependencies]
+# GPU robot rasterizer (falls back to MuJoCo ray casting on the CPU without it)
+raster = ["nvdiffrast @ git+https://github.com/NVlabs/nvdiffrast"]
+eval = ["lpips", "piq", "torchvision"]
+gr1 = ["pyarrow"]
+droid-rlds = ["tfrecord"]
+# MiniMax-H3 video model (simpwm/h3): diffusers at the commit that added MiniMax-H3; use a separate environment
+h3 = [
+    "diffusers @ git+https://github.com/huggingface/diffusers@f53d552036a0d1bd5570782a39cd40cfabf112bc",
+    "safetensors",
+]
+
+[tool.setuptools.packages.find]
+include = ["simpwm*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E9", "F", "B006", "I"]
