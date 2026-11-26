@@ -20,7 +20,7 @@
 
 </div>
 
-https://github.com/user-attachments/assets/774cae88-13b2-46fd-9b36-c976b7f806cc
+https://github.com/user-attachments/assets/84bfe939-bfbc-46ef-9762-072f16f35b90
 
 <p align="center"><sub><b>Real2Sim:</b> the simulator's 4D state of the scene and the robot. <b>Sim2Real:</b> the SimPWM video rendered from it.</sub></p>
 
